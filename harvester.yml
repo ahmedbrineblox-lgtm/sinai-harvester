@@ -1,0 +1,73 @@
+name: SinAI 24-7 Terabyte Dataset Harvester
+
+on:
+  # 1. يشتغل أوتوماتيك كل 6 ساعات على مدار الـ 24 ساعة بدون أي تدخل منك
+  schedule:
+    - cron: '0 */6 * * *'
+
+  # 2. زرار تشغيل يدوي في أي لحظة من تبويب Actions مع تحكم كامل في الإعدادات
+  workflow_dispatch:
+    inputs:
+      hf_target_repo:
+        description: 'مستودع الداتاسيت على Hugging Face'
+        required: true
+        default: 'kemaiagent/SinAI-1-Alpha-Vault'
+      domain_filter:
+        description: 'فلتر القسم (اتركه فارغاً لسحب الـ 90 داتاسيت كلها، أو اكتب مثلاً 07_arabic أو 06_cybersecurity)'
+        required: false
+        default: ''
+      rows_per_dataset:
+        description: 'عدد السجلات من كل داتاسيت في الدورة الواحدة (0 = مفتوح)'
+        required: true
+        default: '15000'
+      shard_rows:
+        description: 'عدد السجلات في كل ملف Parquet مضغوط بـ Zstd'
+        required: true
+        default: '15000'
+      max_runtime_minutes:
+        description: 'أقصى وقت تشغيل بالدقائق قبل الحفظ والإغلاق الآمن (سقف GitHub هو 360 دقيقة)'
+        required: true
+        default: '320'
+
+# يمنع تشغيل دورتين في نفس اللحظة عشان مفيش ملفات تتعارض في الرفع
+concurrency:
+  group: sinai-harvester-group
+  cancel-in-progress: false
+
+jobs:
+  harvest_and_compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 1. Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Install Official Hugging Face & Zstd Parquet Libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U datasets huggingface_hub pyarrow hf_transfer zstandard tqdm
+
+      - name: 4. Run SinAI 90-Dataset Streaming & Zstd Compression Engine
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          HF_TARGET_REPO: ${{ github.event.inputs.hf_target_repo || 'kemaiagent/SinAI-1-Alpha-Vault' }}
+          DOMAIN_FILTER: ${{ github.event.inputs.domain_filter || '' }}
+          ROWS_PER_DATASET: ${{ github.event.inputs.rows_per_dataset || '15000' }}
+          SHARD_ROWS: ${{ github.event.inputs.shard_rows || '15000' }}
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '320' }}
+        run: |
+          python3 sinai_terabyte_harvester.py \
+            --mode stream \
+            --hf-target-repo "$HF_TARGET_REPO" \
+            --domain-filter "$DOMAIN_FILTER" \
+            --rows-per-dataset "$ROWS_PER_DATASET" \
+            --shard-rows "$SHARD_ROWS" \
+            --max-runtime-minutes "$MAX_RUNTIME_MINUTES"
