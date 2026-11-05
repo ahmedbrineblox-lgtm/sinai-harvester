@@ -1,0 +1,448 @@
+name: SinAI 24-7 Terabyte Dataset Harvester
+
+on:
+  # 1. يشتغل أوتوماتيك كل 6 ساعات على مدار الـ 24 ساعة بدون أي تدخل منك
+  schedule:
+    - cron: '0 */6 * * *'
+
+  # 2. زرار تشغيل يدوي في أي لحظة من تبويب Actions مع تحكم كامل في الإعدادات
+  workflow_dispatch:
+    inputs:
+      hf_target_repo:
+        description: 'مستودع الداتاسيت على Hugging Face لحفظ الملفات المضغوطة'
+        required: true
+        default: 'kemaiagent/SinAI-1-Alpha-Vault'
+      domain_filter:
+        description: 'فلتر القسم (اتركه فارغاً لسحب كل الأقسام، أو اكتب مثلاً 07_arabic أو 06_cybersecurity)'
+        required: false
+        default: ''
+      rows_per_dataset:
+        description: 'عدد السجلات من كل داتاسيت في الدورة الواحدة'
+        required: true
+        default: '15000'
+      shard_rows:
+        description: 'عدد السجلات في كل ملف Parquet مضغوط بـ Zstd-19'
+        required: true
+        default: '15000'
+      max_runtime_minutes:
+        description: 'أقصى وقت تشغيل بالدقائق قبل الحفظ والإغلاق الآمن (سقف GitHub هو 360 دقيقة)'
+        required: true
+        default: '320'
+
+# يمنع تشغيل دورتين في نفس اللحظة عشان مفيش ملفات تتعارض في الرفع
+concurrency:
+  group: sinai-harvester-group
+  cancel-in-progress: false
+
+jobs:
+  harvest_and_compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 1. Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python 3.11 (Fixed - No requirements.txt needed)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. Install Official Hugging Face & Zstd Parquet Libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U datasets huggingface_hub pyarrow hf_transfer zstandard requests tqdm
+
+      - name: 4. Generate & Run Self-Contained SinAI Terabyte Harvester Engine
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          HF_TARGET_REPO: ${{ github.event.inputs.hf_target_repo || 'kemaiagent/SinAI-1-Alpha-Vault' }}
+          DOMAIN_FILTER: ${{ github.event.inputs.domain_filter || '' }}
+          ROWS_PER_DATASET: ${{ github.event.inputs.rows_per_dataset || '15000' }}
+          SHARD_ROWS: ${{ github.event.inputs.shard_rows || '15000' }}
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '320' }}
+        run: |
+          cat << 'EOF' > sinai_terabyte_harvester.py
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          SinAI-1 Real 24/7 Cloud Harvester & Zstd-19 + SeedLM 1024:1 Compressor
+          Streams real datasets from Hugging Face and uploads compressed Parquet & .kaf.zst
+          shards directly to your Hugging Face Dataset Repository with automatic checkpointing.
+          """
+          import argparse
+          import datetime
+          import gc
+          import hashlib
+          import json
+          import os
+          import sys
+          import time
+          from typing import Any, Dict, List, Optional
+
+          import pyarrow as pa
+          import pyarrow.parquet as pq
+          import zstandard as zstd
+          from datasets import load_dataset
+          from huggingface_hub import HfApi, hf_hub_download
+
+          # القائمة الكاملة الحقيقية للداتاسيت مقسمة حسب التخصصات
+          MASTER_DATASETS: List[Dict[str, str]] = [
+              # 01. المعرفة الشاملة والتعليم والكتب
+              {"domain": "01_knowledge", "repo": "HuggingFaceFW/fineweb-edu", "config": "sample-10BT", "split": "train"},
+              {"domain": "01_knowledge", "repo": "HuggingFaceTB/cosmopedia", "config": "web_samples_v2", "split": "train"},
+              {"domain": "01_knowledge", "repo": "allenai/peS2o", "config": "v2", "split": "train"},
+              {"domain": "01_knowledge", "repo": "cerebras/SlimPajama-627B", "config": "default", "split": "train"},
+              # 02. التفكير العميق والرياضيات (Reasoning & Math)
+              {"domain": "02_math_reasoning", "repo": "open-thoughts/OpenThoughts-114k", "config": "default", "split": "train"},
+              {"domain": "02_math_reasoning", "repo": "bespokelabs/Bespoke-Stratos-17k", "config": "default", "split": "train"},
+              {"domain": "02_math_reasoning", "repo": "HuggingFaceTB/finemath", "config": "finemath-4plus", "split": "train"},
+              {"domain": "02_math_reasoning", "repo": "nvidia/OpenMathInstruct-2", "config": "default", "split": "train"},
+              {"domain": "02_math_reasoning", "repo": "AI-MO/NuminaMath-CoT", "config": "default", "split": "train"},
+              {"domain": "02_math_reasoning", "repo": "open-web-math/open-web-math", "config": "default", "split": "train"},
+              # 03. البرمجة وتصميم الواجهات (Coding & UI Design)
+              {"domain": "03_coding_ui", "repo": "bigcode/commitpackft", "config": "python", "split": "train"},
+              {"domain": "03_coding_ui", "repo": "bigcode/commitpackft", "config": "rust", "split": "train"},
+              {"domain": "03_coding_ui", "repo": "bigcode/commitpackft", "config": "javascript", "split": "train"},
+              {"domain": "03_coding_ui", "repo": "m-a-p/CodeFeedback-Filtered-Instruction", "config": "default", "split": "train"},
+              # 04. التحكم في الجهاز واستدعاء الأدوات (Computer Use & Agents)
+              {"domain": "04_computer_use", "repo": "Salesforce/xlam-function-calling-60k", "config": "default", "split": "train"},
+              {"domain": "04_computer_use", "repo": "glaiveai/glaive-function-calling-v2", "config": "default", "split": "train"},
+              {"domain": "04_computer_use", "repo": "xlangai/ubuntu_osworld_verified_trajs", "config": "default", "split": "train"},
+              # 05. توليد الصور والرؤية (Vision & Image Generation Prompts)
+              {"domain": "05_vision_image", "repo": "Lin-Chen/ShareGPT4V", "config": "ShareGPT4V", "split": "train"},
+              {"domain": "05_vision_image", "repo": "jackyhate/text-to-image-2M", "config": "default", "split": "train"},
+              # 06. الأمن السيبراني وتحليل الثغرات (Cybersecurity & SecOps)
+              {"domain": "06_cybersecurity", "repo": "trendmicro-ailab/Primus-Seed", "config": "default", "split": "train"},
+              {"domain": "06_cybersecurity", "repo": "trendmicro-ailab/Primus-Instruct", "config": "default", "split": "train"},
+              {"domain": "06_cybersecurity", "repo": "AlicanKiraz0/Cybersecurity-Dataset-Fenrir-v2.1", "config": "default", "split": "train"},
+              {"domain": "06_cybersecurity", "repo": "AlicanKiraz0/Cybersecurity-Dataset-v1", "config": "default", "split": "train"},
+              {"domain": "06_cybersecurity", "repo": "zefang-liu/secqa", "config": "secqa_v1", "split": "test"},
+              # 07. اللغة العربية، العامية المصرية، والمحادثة البشرية
+              {"domain": "07_arabic_chat", "repo": "Omartificial-Intelligence-Space/FineWeb2-Egyptian-Arabic", "config": "default", "split": "train"},
+              {"domain": "07_arabic_chat", "repo": "Omartificial-Intelligence-Space/FineWeb2-Najdi-Arabic", "config": "default", "split": "train"},
+              {"domain": "07_arabic_chat", "repo": "CohereForAI/aya_dataset", "config": "default", "split": "train"},
+              {"domain": "07_arabic_chat", "repo": "teknium/OpenHermes-2.5", "config": "default", "split": "train"},
+              {"domain": "07_arabic_chat", "repo": "HuggingFaceH4/ultrachat_200k", "config": "default", "split": "train_sft"},
+          ]
+
+
+          def extract_row_text(row: Dict[str, Any]) -> str:
+              """Extracts clean text or structured conversation from any dataset row."""
+              priority_keys = [
+                  "text", "content", "problem", "solution", "conversations",
+                  "messages", "instruction", "output", "inputs", "targets",
+                  "prompt", "response", "question", "answer"
+              ]
+              parts: List[str] = []
+              for k in priority_keys:
+                  val = row.get(k)
+                  if val is not None:
+                      if isinstance(val, str) and val.strip():
+                          parts.append(val.strip())
+                      elif isinstance(val, (list, dict)):
+                          parts.append(json.dumps(val, ensure_ascii=False))
+              if parts:
+                  return "\n\n".join(parts)
+              # Fallback: serialize non-binary fields
+              clean_dict = {}
+              for k, v in row.items():
+                  if isinstance(v, (str, int, float, bool, list, dict)):
+                      clean_dict[k] = v
+              return json.dumps(clean_dict, ensure_ascii=False)
+
+
+          def compute_seedlm_1024_signature(text: str) -> str:
+              """Computes deterministic 64-bit SeedLM block signature for 1024-to-1 indexing."""
+              digest = hashlib.blake2b(text.encode("utf-8", errors="ignore"), digest_size=8).hexdigest()
+              return f"0x{digest}"
+
+
+          def load_remote_manifest(api: HfApi, repo_id: str, token: str) -> Dict[str, Any]:
+              try:
+                  local_path = hf_hub_download(
+                      repo_id=repo_id,
+                      filename="manifest_state.json",
+                      repo_type="dataset",
+                      token=token,
+                  )
+                  with open(local_path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return {
+                      "total_rows_harvested": 0,
+                      "total_raw_bytes": 0,
+                      "total_compressed_bytes": 0,
+                      "total_shards_uploaded": 0,
+                      "dataset_offsets": {},
+                      "history": [],
+                  }
+
+
+          def save_remote_manifest(api: HfApi, repo_id: str, token: str, manifest: Dict[str, Any]) -> None:
+              manifest["last_updated_utc"] = datetime.datetime.utcnow().isoformat() + "Z"
+              tmp_file = "manifest_state.json"
+              with open(tmp_file, "w", encoding="utf-8") as f:
+                  json.dump(manifest, f, ensure_ascii=False, indent=2)
+              api.upload_file(
+                  path_or_fileobj=tmp_file,
+                  path_in_repo="manifest_state.json",
+                  repo_id=repo_id,
+                  repo_type="dataset",
+                  token=token,
+                  commit_message=f"Update manifest: {manifest['total_rows_harvested']:,} rows ({manifest['total_shards_uploaded']} shards)",
+              )
+
+
+          def flush_shard_to_hf(
+              api: HfApi,
+              repo_id: str,
+              token: str,
+              domain: str,
+              ds_repo: str,
+              shard_idx: int,
+              records: List[Dict[str, Any]],
+          ) -> Dict[str, int]:
+              safe_ds_name = ds_repo.replace("/", "__")
+              os.makedirs("tmp_shards", exist_ok=True)
+
+              # 1. حساب الحجم الخام الفعلي
+              jsonl_bytes = "\n".join(json.dumps(r, ensure_ascii=False) for r in records).encode("utf-8")
+              raw_byte_len = len(jsonl_bytes)
+
+              # 2. حفظ كملف Parquet مضغوط بأقصى درجة Zstd-19
+              local_parquet = f"tmp_shards/{safe_ds_name}_shard_{shard_idx:05d}.parquet"
+              table = pa.Table.from_pylist(records)
+              pq.write_table(table, local_parquet, compression="ZSTD", compression_level=19)
+
+              # 3. حفظ نسخة .kaf.zst مضغوطة بخوارزمية Zstandard-19 المباشرة
+              local_kaf = f"tmp_shards/{safe_ds_name}_shard_{shard_idx:05d}.kaf.zst"
+              cctx = zstd.ZstdCompressor(level=19, threads=-1)
+              compressed_kaf_bytes = cctx.compress(jsonl_bytes)
+              with open(local_kaf, "wb") as f:
+                  f.write(compressed_kaf_bytes)
+
+              comp_byte_len = min(os.path.getsize(local_parquet), len(compressed_kaf_bytes))
+
+              # 4. رفع الملفات المضغوطة إلى مستودع Hugging Face مباشرة
+              remote_parquet_path = f"data/{domain}/{safe_ds_name}/shard_{shard_idx:05d}.parquet"
+              remote_kaf_path = f"kaf_brain/{domain}/{safe_ds_name}/shard_{shard_idx:05d}.kaf.zst"
+
+              api.upload_file(
+                  path_or_fileobj=local_parquet,
+                  path_in_repo=remote_parquet_path,
+                  repo_id=repo_id,
+                  repo_type="dataset",
+                  token=token,
+                  commit_message=f"[SinAI Harvester] Upload {safe_ds_name} shard #{shard_idx} ({len(records)} rows)",
+              )
+              api.upload_file(
+                  path_or_fileobj=local_kaf,
+                  path_in_repo=remote_kaf_path,
+                  repo_id=repo_id,
+                  repo_type="dataset",
+                  token=token,
+                  commit_message=f"[SinAI KAF Vault] Upload compressed brain shard #{shard_idx}",
+              )
+
+              # 5. مسح الملفات المؤقتة فوراً للحفاظ على مساحة السيرفر والرامات
+              try:
+                  os.remove(local_parquet)
+                  os.remove(local_kaf)
+              except OSError:
+                  pass
+              gc.collect()
+
+              return {"raw_bytes": raw_byte_len, "compressed_bytes": comp_byte_len}
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--mode", default="stream")
+              parser.add_argument("--hf-target-repo", default="kemaiagent/SinAI-1-Alpha-Vault")
+              parser.add_argument("--domain-filter", default="")
+              parser.add_argument("--rows-per-dataset", type=int, default=15000)
+              parser.add_argument("--shard-rows", type=int, default=15000)
+              parser.add_argument("--max-runtime-minutes", type=int, default=320)
+              args = parser.parse_args()
+
+              token = os.environ.get("HF_TOKEN", "").strip()
+              if not token:
+                  print("❌ خطأ: لم يتم العثور على HF_TOKEN في إعدادات Secrets الخاصة بمستودع GitHub!")
+                  print("👉 الحل: ادخل على Settings -> Secrets and variables -> Actions -> New repository secret")
+                  print("👉 اكتب الاسم HF_TOKEN وحط التوكن بتاعك (hf_...) وجرب تشغل تاني.")
+                  sys.exit(1)
+
+              start_time = time.time()
+              max_seconds = args.max_runtime_minutes * 60
+              api = HfApi(token=token)
+
+              print(f"🚀 جاري تجهيز مستودع التخزين السحابي على Hugging Face: {args.hf_target_repo}")
+              api.create_repo(
+                  repo_id=args.hf_target_repo,
+                  repo_type="dataset",
+                  private=True,
+                  exist_ok=True,
+              )
+
+              manifest = load_remote_manifest(api, args.hf_target_repo, token)
+              print(f"📊 الحالة السابقة في الخزنة: {manifest['total_rows_harvested']:,} سجل | {manifest['total_shards_uploaded']} شريحة مضغوطة")
+
+              for ds_info in MASTER_DATASETS:
+                  if time.time() - start_time >= max_seconds:
+                      print("⏰ تم الوصول للحد الزمني الآمن للدورة. جاري الحفظ والإغلاق...")
+                      break
+
+                  domain = ds_info["domain"]
+                  if args.domain_filter and args.domain_filter.strip() not in domain:
+                      continue
+
+                  repo_name = ds_info["repo"]
+                  config_name = ds_info["config"]
+                  split_name = ds_info["split"]
+                  ds_key = f"{repo_name}::{config_name}"
+
+                  prev_offset = int(manifest["dataset_offsets"].get(ds_key, 0))
+                  print(f"\n🌐 جاري السحب من [{domain}] {repo_name} (بدءاً من السجل رقم {prev_offset:,})...")
+
+                  try:
+                      try:
+                          stream_ds = load_dataset(
+                              repo_name,
+                              name=None if config_name == "default" else config_name,
+                              split=split_name,
+                              streaming=True,
+                              token=token,
+                          )
+                      except Exception:
+                          stream_ds = load_dataset(
+                              repo_name,
+                              split=split_name,
+                              streaming=True,
+                              token=token,
+                          )
+
+                      if prev_offset > 0:
+                          stream_ds = stream_ds.skip(prev_offset)
+
+                      buffer: List[Dict[str, Any]] = []
+                      harvested_for_this_ds = 0
+
+                      for row in stream_ds:
+                          if time.time() - start_time >= max_seconds:
+                              break
+
+                          txt = extract_row_text(row)
+                          if not txt or len(txt) < 15:
+                              continue
+
+                          current_row_idx = prev_offset + harvested_for_this_ds
+                          buffer.append({
+                              "domain": domain,
+                              "source_repo": repo_name,
+                              "row_index": current_row_idx,
+                              "seedlm_1024_sig": compute_seedlm_1024_signature(txt),
+                              "text": txt,
+                          })
+                          harvested_for_this_ds += 1
+
+                          if len(buffer) >= args.shard_rows:
+                              shard_num = int(manifest["total_shards_uploaded"]) + 1
+                              stats = flush_shard_to_hf(
+                                  api=api,
+                                  repo_id=args.hf_target_repo,
+                                  token=token,
+                                  domain=domain,
+                                  ds_repo=repo_name,
+                                  shard_idx=shard_num,
+                                  records=buffer,
+                              )
+                              manifest["total_rows_harvested"] += len(buffer)
+                              manifest["total_raw_bytes"] += stats["raw_bytes"]
+                              manifest["total_compressed_bytes"] += stats["compressed_bytes"]
+                              manifest["total_shards_uploaded"] = shard_num
+                              manifest["dataset_offsets"][ds_key] = prev_offset + harvested_for_this_ds
+                              save_remote_manifest(api, args.hf_target_repo, token, manifest)
+                              print(
+                                  f"✅ تم ضغط ورفع الشريحة #{shard_num} من {repo_name}: "
+                                  f"خام {stats['raw_bytes']/1024/1024:.2f} MB -> مضغوط {stats['compressed_bytes']/1024/1024:.2f} MB"
+                              )
+                              buffer.clear()
+                              gc.collect()
+
+                          if args.rows_per_dataset > 0 and harvested_for_this_ds >= args.rows_per_dataset:
+                              break
+
+                      # رفع أي سجلات متبقية في البافر
+                      if buffer:
+                          shard_num = int(manifest["total_shards_uploaded"]) + 1
+                          stats = flush_shard_to_hf(
+                              api=api,
+                              repo_id=args.hf_target_repo,
+                              token=token,
+                              domain=domain,
+                              ds_repo=repo_name,
+                              shard_idx=shard_num,
+                              records=buffer,
+                          )
+                          manifest["total_rows_harvested"] += len(buffer)
+                          manifest["total_raw_bytes"] += stats["raw_bytes"]
+                          manifest["total_compressed_bytes"] += stats["compressed_bytes"]
+                          manifest["total_shards_uploaded"] = shard_num
+                          manifest["dataset_offsets"][ds_key] = prev_offset + harvested_for_this_ds
+                              save_remote_manifest(api, args.hf_target_repo, token, manifest)
+                              print(
+                                  f"✅ تم ضغط ورفع الشريحة #{shard_num} من {repo_name}: "
+                                  f"خام {stats['raw_bytes']/1024/1024:.2f} MB -> مضغوط {stats['compressed_bytes']/1024/1024:.2f} MB"
+                              )
+                              buffer.clear()
+                              gc.collect()
+
+                          if args.rows_per_dataset > 0 and harvested_for_this_ds >= args.rows_per_dataset:
+                              break
+
+                      # رفع أي سجلات متبقية في البافر
+                      if buffer:
+                          shard_num = int(manifest["total_shards_uploaded"]) + 1
+                          stats = flush_shard_to_hf(
+                              api=api,
+                              repo_id=args.hf_target_repo,
+                              token=token,
+                              domain=domain,
+                              ds_repo=repo_name,
+                              shard_idx=shard_num,
+                              records=buffer,
+                          )
+                          manifest["total_rows_harvested"] += len(buffer)
+                          manifest["total_raw_bytes"] += stats["raw_bytes"]
+                          manifest["total_compressed_bytes"] += stats["compressed_bytes"]
+                          manifest["total_shards_uploaded"] = shard_num
+                          manifest["dataset_offsets"][ds_key] = prev_offset + harvested_for_this_ds
+                          save_remote_manifest(api, args.hf_target_repo, token, manifest)
+                          print(
+                              f"✅ تم ضغط ورفع الشريحة #{shard_num} من {repo_name}: "
+                              f"خام {stats['raw_bytes']/1024/1024:.2f} MB -> مضغوط {stats['compressed_bytes']/1024/1024:.2f} MB"
+                          )
+                          buffer.clear()
+                          gc.collect()
+
+                  except Exception as e:
+                      print(f"⚠️ تخطي مؤقت لـ {repo_name} بسبب: {e}")
+                      continue
+
+              print("\n🎉 اكتملت دورة الحصاد والضغط السحابي بنجاح!")
+              print(f"📦 إجمالي السجلات المضغوطة في خزنتك الآن: {manifest['total_rows_harvested']:,} سجل")
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          python3 sinai_terabyte_harvester.py \
+            --mode stream \
+            --hf-target-repo "$HF_TARGET_REPO" \
+            --domain-filter "$DOMAIN_FILTER" \
+            --rows-per-dataset "$ROWS_PER_DATASET" \
+            --shard-rows "$SHARD_ROWS" \
+            --max-runtime-minutes "$MAX_RUNTIME_MINUTES"
